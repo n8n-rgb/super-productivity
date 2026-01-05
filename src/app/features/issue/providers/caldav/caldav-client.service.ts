@@ -8,7 +8,7 @@ import Calendar from 'cdav-library/models/calendar';
 import ICAL from 'ical.js';
 
 import { from, Observable, throwError } from 'rxjs';
-import { CaldavIssue, CaldavIssueStatus } from './caldav-issue.model';
+import { CaldavIssue, CaldavIssueStatus, CaldavEvent } from './caldav-issue.model';
 import { CALDAV_TYPE, ISSUE_PROVIDER_HUMANIZED } from '../../issue.const';
 import { SearchResultItem } from '../../issue.model';
 import { SnackService } from '../../../../core/snack/snack.service';
@@ -39,17 +39,29 @@ export class CaldavClientService {
   private _clientCache = new Map<string, ClientCache>();
 
   private static _isValidSettings(cfg: CaldavCfg): boolean {
-    return (
+    const hasBaseSettings =
       !!cfg &&
       !!cfg.caldavUrl &&
       cfg.caldavUrl.length > 0 &&
       !!cfg.resourceName &&
-      cfg.resourceName.length > 0 &&
-      !!cfg.username &&
-      cfg.username.length > 0 &&
-      !!cfg.password &&
-      cfg.password.length > 0
-    );
+      cfg.resourceName.length > 0;
+
+    if (!hasBaseSettings) {
+      return false;
+    }
+
+    // Check auth based on authType
+    if (cfg.authType === 'bearer') {
+      return !!cfg.bearerToken && cfg.bearerToken.length > 0;
+    } else {
+      // Default to basic auth
+      return (
+        !!cfg.username &&
+        cfg.username.length > 0 &&
+        !!cfg.password &&
+        cfg.password.length > 0
+      );
+    }
   }
 
   private static _getCalendarUriFromUrl(url: string): string {
@@ -170,10 +182,136 @@ export class CaldavClientService {
     return hash;
   }
 
+  // VEVENT support methods
+  private static async _getAllEvents(
+    calendar: Calendar,
+    startDate: Date,
+    endDate: Date,
+  ): Promise<CalDavTaskData[]> {
+    const formatDate = (d: Date): string =>
+      d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+
+    const query = {
+      name: [NS.IETF_CALDAV, 'comp-filter'],
+      attributes: [['name', 'VCALENDAR']],
+      children: [
+        {
+          name: [NS.IETF_CALDAV, 'comp-filter'],
+          attributes: [['name', 'VEVENT']],
+          children: [
+            {
+              name: [NS.IETF_CALDAV, 'time-range'],
+              attributes: [
+                ['start', formatDate(startDate)],
+                ['end', formatDate(endDate)],
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    return await calendar.calendarQuery([query]);
+  }
+
+  private static async _findEventByUid(
+    calendar: Calendar,
+    eventUid: string,
+  ): Promise<CalDavTaskData[]> {
+    const query = {
+      name: [NS.IETF_CALDAV, 'comp-filter'],
+      attributes: [['name', 'VCALENDAR']],
+      children: [
+        {
+          name: [NS.IETF_CALDAV, 'comp-filter'],
+          attributes: [['name', 'VEVENT']],
+          children: [
+            {
+              name: [NS.IETF_CALDAV, 'prop-filter'],
+              attributes: [['name', 'uid']],
+              children: [
+                {
+                  name: [NS.IETF_CALDAV, 'text-match'],
+                  value: eventUid,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    return await calendar.calendarQuery([query]);
+  }
+
+  private static _mapEvent(event: CalDavTaskData): CaldavEvent {
+    const jCal = ICAL.parse(event.data);
+    const comp = new ICAL.Component(jCal);
+    const vevent = comp.getFirstSubcomponent('vevent');
+
+    if (!vevent) {
+      IssueLog.log(event);
+      throw new Error('No vevent found for event');
+    }
+
+    const categoriesProperty = vevent.getAllProperties('categories')[0];
+    const categories: string[] = categoriesProperty?.getValues() || [];
+
+    const dtstart = vevent.getFirstPropertyValue('dtstart') as ICAL.Time;
+    const dtend = vevent.getFirstPropertyValue('dtend') as ICAL.Time;
+    const durationProp = vevent.getFirstPropertyValue(
+      'duration',
+    ) as unknown as ICAL.Duration;
+
+    // Detect all-day events: VALUE=DATE means no time component
+    const isAllDay = dtstart?.isDate || false;
+
+    const startTime = dtstart?.toJSDate().getTime() || Date.now();
+    let endTime: number | undefined;
+    let duration: number;
+
+    if (dtend) {
+      endTime = dtend.toJSDate().getTime();
+      duration = endTime - startTime;
+    } else if (durationProp) {
+      duration = durationProp.toSeconds() * 1000;
+      endTime = startTime + duration;
+    } else if (isAllDay) {
+      // All-day events without end default to 1 day
+      duration = 24 * 60 * 60 * 1000;
+      endTime = startTime + duration;
+    } else {
+      // Default to 1 hour for timed events without duration
+      duration = 60 * 60 * 1000;
+      endTime = startTime + duration;
+    }
+
+    return {
+      id: vevent.getFirstPropertyValue('uid') as string,
+      item_url: event.url,
+      summary: (vevent.getFirstPropertyValue('summary') as string) || '',
+      start: startTime,
+      end: endTime,
+      duration,
+      description: (vevent.getFirstPropertyValue('description') as string) || undefined,
+      location: (vevent.getFirstPropertyValue('location') as string) || undefined,
+      categories,
+      etag_hash: this._hashEtag(event.etag),
+      isAllDay,
+      // For type compatibility with CaldavIssue
+      completed: false, // Events don't have completion status
+      labels: categories, // Alias for categories
+    };
+  }
+
   async _get_client(cfg: CaldavCfg): Promise<ClientCache> {
     this._checkSettings(cfg);
 
-    const client_key = `${cfg.caldavUrl}|${cfg.username}|${cfg.password}`;
+    // Cache key depends on auth type
+    const authPart =
+      cfg.authType === 'bearer'
+        ? `bearer|${cfg.bearerToken}`
+        : `basic|${cfg.username}|${cfg.password}`;
+    const client_key = `${cfg.caldavUrl}|${authPart}`;
 
     if (this._clientCache.has(client_key)) {
       return this._clientCache.get(client_key) as ClientCache;
@@ -266,9 +404,10 @@ export class CaldavClientService {
   }
 
   getByIds$(ids: string[], cfg: CaldavCfg): Observable<CaldavIssue[]> {
+    const idSet = new Set(ids);
     return from(
       this._getTasks(cfg, false, false).then((tasks) =>
-        tasks.filter((task) => task.id in ids),
+        tasks.filter((task) => idSet.has(task.id)),
       ),
     ).pipe(
       catchError((err) => throwError({ [HANDLED_ERROR_PROP_STR]: 'Caldav: ' + err })),
@@ -288,6 +427,59 @@ export class CaldavClientService {
     );
   }
 
+  // VEVENT public methods
+  getOpenEvents$(cfg: CaldavCfg): Observable<CaldavEvent[]> {
+    return from(this._getEvents(cfg, true)).pipe(
+      catchError((err) => throwError({ [HANDLED_ERROR_PROP_STR]: 'Caldav: ' + err })),
+    );
+  }
+
+  searchOpenEvents$(text: string, cfg: CaldavCfg): Observable<SearchResultItem[]> {
+    return from(
+      this._getEvents(cfg, true).then((events) =>
+        events
+          .filter((ev) => ev.summary.toLowerCase().includes(text.toLowerCase()))
+          .map((ev) => ({
+            title: ev.summary,
+            issueType: CALDAV_TYPE,
+            issueData: ev,
+          })),
+      ),
+    ).pipe(
+      catchError((err) => throwError({ [HANDLED_ERROR_PROP_STR]: 'Caldav: ' + err })),
+    );
+  }
+
+  getEventById$(id: string | number, cfg: CaldavCfg): Observable<CaldavEvent> {
+    if (typeof id === 'number') {
+      id = id.toString(10);
+    }
+    return from(this._getEvent(cfg, id)).pipe(
+      catchError((err) => throwError({ [HANDLED_ERROR_PROP_STR]: 'Caldav: ' + err })),
+    );
+  }
+
+  updateEvent$(
+    cfg: CaldavCfg,
+    eventId: string,
+    updates: {
+      summary?: string;
+      description?: string;
+      dtstart?: number;
+      dtend?: number;
+    },
+  ): Observable<void> {
+    return from(this._updateEvent(cfg, eventId, updates)).pipe(
+      catchError((err) => throwError({ [HANDLED_ERROR_PROP_STR]: 'Caldav: ' + err })),
+    );
+  }
+
+  deleteEvent$(cfg: CaldavCfg, eventId: string): Observable<void> {
+    return from(this._deleteEvent(cfg, eventId)).pipe(
+      catchError((err) => throwError({ [HANDLED_ERROR_PROP_STR]: 'Caldav: ' + err })),
+    );
+  }
+
   private _getXhrProvider(cfg: CaldavCfg): () => XMLHttpRequest {
     // eslint-disable-next-line prefer-arrow/prefer-arrow-functions
     function xhrProvider(): XMLHttpRequest {
@@ -302,10 +494,16 @@ export class CaldavClientService {
         const result = oldOpen.apply(this, arguments);
         // @ts-ignore
         xhr.setRequestHeader('X-Requested-With', 'SuperProductivity');
-        xhr.setRequestHeader(
-          'Authorization',
-          'Basic ' + btoa(cfg.username + ':' + cfg.password),
-        );
+
+        // Support both Basic and Bearer auth
+        if (cfg.authType === 'bearer' && cfg.bearerToken) {
+          xhr.setRequestHeader('Authorization', `Bearer ${cfg.bearerToken}`);
+        } else {
+          xhr.setRequestHeader(
+            'Authorization',
+            'Basic ' + btoa(cfg.username + ':' + cfg.password),
+          );
+        }
         return result;
       };
       return xhr;
@@ -452,5 +650,207 @@ export class CaldavClientService {
     if (task.update) {
       await task.update().catch((err) => this._handleNetErr(err));
     }
+  }
+
+  // VEVENT private helper methods
+  private async _getEvents(
+    cfg: CaldavCfg,
+    filterCategory: boolean,
+  ): Promise<CaldavEvent[]> {
+    const cal = await this._getCalendar(cfg);
+
+    // Get events from today to today + 30 days
+    const startDate = new Date();
+    startDate.setHours(0, 0, 0, 0);
+    const endDate = new Date(startDate);
+    endDate.setDate(endDate.getDate() + 30);
+
+    const events = await CaldavClientService._getAllEvents(cal, startDate, endDate).catch(
+      (err) => this._handleNetErr(err),
+    );
+
+    return events
+      .map((e) => CaldavClientService._mapEvent(e))
+      .filter(
+        (e: CaldavEvent) =>
+          !filterCategory ||
+          !cfg.categoryFilter ||
+          e.categories.includes(cfg.categoryFilter),
+      );
+  }
+
+  private async _getEvent(cfg: CaldavCfg, uid: string): Promise<CaldavEvent> {
+    const cal = await this._getCalendar(cfg);
+    const events = await CaldavClientService._findEventByUid(cal, uid).catch((err) =>
+      this._handleNetErr(err),
+    );
+
+    if (events.length < 1) {
+      this._snackService.open({
+        type: 'ERROR',
+        msg: T.F.CALDAV.S.ISSUE_NOT_FOUND,
+      });
+      throw new Error('EVENT NOT FOUND: ' + uid);
+    }
+
+    return CaldavClientService._mapEvent(events[0]);
+  }
+
+  private async _updateEvent(
+    cfg: CaldavCfg,
+    uid: string,
+    updates: {
+      summary?: string;
+      description?: string;
+      dtstart?: number;
+      dtend?: number;
+    },
+  ): Promise<void> {
+    const cal = await this._getCalendar(cfg);
+
+    if (cal.readOnly) {
+      this._snackService.open({
+        type: 'ERROR',
+        translateParams: {
+          calendarName: cfg.resourceName as string,
+        },
+        msg: T.F.CALDAV.S.CALENDAR_READ_ONLY,
+      });
+      throw new Error('CALENDAR READ ONLY: ' + cfg.resourceName);
+    }
+
+    const events = await CaldavClientService._findEventByUid(cal, uid).catch((err) =>
+      this._handleNetErr(err),
+    );
+
+    if (events.length < 1) {
+      this._snackService.open({
+        type: 'ERROR',
+        translateParams: {
+          issueId: uid,
+        },
+        msg: T.F.CALDAV.S.ISSUE_NOT_FOUND,
+      });
+      throw new Error('EVENT NOT FOUND: ' + uid);
+    }
+
+    const event = events[0];
+    const jCal = ICAL.parse(event.data);
+    const comp = new ICAL.Component(jCal);
+    const vevent = comp.getFirstSubcomponent('vevent');
+
+    if (!vevent) {
+      IssueLog.err('No vevent found for event', event);
+      return;
+    }
+
+    const now = ICAL.Time.now();
+    let changeObserved = false;
+
+    if (updates.summary !== undefined) {
+      const oldSummary = vevent.getFirstPropertyValue('summary');
+      if (updates.summary !== oldSummary) {
+        vevent.updatePropertyWithValue('summary', updates.summary);
+        changeObserved = true;
+      }
+    }
+
+    if (updates.description !== undefined) {
+      const oldDescription = vevent.getFirstPropertyValue('description');
+      if (updates.description !== oldDescription) {
+        if (updates.description) {
+          vevent.updatePropertyWithValue('description', updates.description);
+        } else {
+          vevent.removeProperty('description');
+        }
+        changeObserved = true;
+      }
+    }
+
+    if (updates.dtstart !== undefined) {
+      const newStart = ICAL.Time.fromJSDate(new Date(updates.dtstart), false);
+      vevent.updatePropertyWithValue('dtstart', newStart);
+      changeObserved = true;
+    }
+
+    if (updates.dtend !== undefined) {
+      const newEnd = ICAL.Time.fromJSDate(new Date(updates.dtend), false);
+      vevent.updatePropertyWithValue('dtend', newEnd);
+      changeObserved = true;
+    }
+
+    if (!changeObserved) {
+      return;
+    }
+
+    vevent.updatePropertyWithValue('last-modified', now);
+    vevent.updatePropertyWithValue('dtstamp', now);
+
+    // Increment SEQUENCE for client compatibility
+    const sequence = vevent.getFirstPropertyValue('sequence');
+    const sequenceInt = sequence ? parseInt(sequence as string) + 1 : 1;
+    vevent.updatePropertyWithValue('sequence', sequenceInt);
+
+    event.data = ICAL.stringify(jCal);
+    if (event.update) {
+      await event.update().catch((err) => this._handleNetErr(err));
+    }
+  }
+
+  private async _deleteEvent(cfg: CaldavCfg, uid: string): Promise<void> {
+    const cal = await this._getCalendar(cfg);
+
+    if (cal.readOnly) {
+      this._snackService.open({
+        type: 'ERROR',
+        translateParams: {
+          calendarName: cfg.resourceName as string,
+        },
+        msg: T.F.CALDAV.S.CALENDAR_READ_ONLY,
+      });
+      throw new Error('CALENDAR READ ONLY: ' + cfg.resourceName);
+    }
+
+    const events = await CaldavClientService._findEventByUid(cal, uid).catch((err) =>
+      this._handleNetErr(err),
+    );
+
+    if (events.length < 1) {
+      // Event already deleted, nothing to do
+      return;
+    }
+
+    const event = events[0];
+    const deleteUrl = event.url;
+
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('DELETE', deleteUrl, true); // true = async
+
+      xhr.setRequestHeader('X-Requested-With', 'SuperProductivity');
+
+      if (cfg.authType === 'bearer' && cfg.bearerToken) {
+        xhr.setRequestHeader('Authorization', `Bearer ${cfg.bearerToken}`);
+      } else {
+        xhr.setRequestHeader(
+          'Authorization',
+          'Basic ' + btoa(cfg.username + ':' + cfg.password),
+        );
+      }
+
+      xhr.onload = (): void => {
+        if (xhr.status >= 400) {
+          reject(new Error(`Failed to delete event: ${xhr.status} ${xhr.statusText}`));
+        } else {
+          resolve();
+        }
+      };
+
+      xhr.onerror = (): void => {
+        reject(new Error('Network error during event deletion'));
+      };
+
+      xhr.send();
+    });
   }
 }

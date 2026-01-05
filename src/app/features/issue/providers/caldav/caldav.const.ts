@@ -10,6 +10,11 @@ export const DEFAULT_CALDAV_CFG: CaldavCfg = {
   password: null,
   isTransitionIssuesEnabled: false,
   categoryFilter: null,
+  // New defaults for VEVENT and Google Calendar support
+  componentType: 'VTODO',
+  authType: 'basic',
+  bearerToken: null,
+  enableWriteBack: false,
 };
 
 export const CALDAV_POLL_INTERVAL = 10 * 60 * 1000;

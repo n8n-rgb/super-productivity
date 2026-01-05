@@ -1,0 +1,38 @@
+<h1 mat-dialog-title>
+  <mat-icon class="dialog-header-icon">event</mat-icon>
+  <span>{{ T.F.CALDAV.DELETE_DIALOG.TITLE | translate }}</span>
+</h1>
+
+<mat-dialog-content>
+  <p>{{ T.F.CALDAV.DELETE_DIALOG.MESSAGE | translate }}</p>
+  <p>
+    <strong>{{ data.taskTitle }}</strong>
+  </p>
+</mat-dialog-content>
+
+<mat-dialog-actions align="end">
+  <div class="wrap-buttons">
+    <button
+      (click)="cancel()"
+      color="primary"
+      mat-button
+      type="button"
+    >
+      {{ T.G.CANCEL | translate }}
+    </button>
+    <button
+      (click)="keepEvent()"
+      color="primary"
+      mat-button
+    >
+      {{ T.F.CALDAV.DELETE_DIALOG.KEEP_EVENT | translate }}
+    </button>
+    <button
+      (click)="deleteBoth()"
+      color="warn"
+      mat-stroked-button
+    >
+      {{ T.F.CALDAV.DELETE_DIALOG.DELETE_BOTH | translate }}
+    </button>
+  </div>
+</mat-dialog-actions>

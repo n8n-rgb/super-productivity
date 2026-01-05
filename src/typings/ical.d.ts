@@ -5,8 +5,14 @@ declare module 'ical.js' {
   namespace ICAL {
     class Time {
       static now(): Time;
+      static fromJSDate(date: Date, useUtc?: boolean): Time;
       icaltype: string;
+      isDate: boolean;
       toJSDate(): Date;
+    }
+
+    class Duration {
+      toSeconds(): number;
     }
 
     class VCardTime extends Time {

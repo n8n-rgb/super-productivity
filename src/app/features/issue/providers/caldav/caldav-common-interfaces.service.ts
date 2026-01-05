@@ -3,7 +3,12 @@ import { Observable, of } from 'rxjs';
 import { IssueTask, Task } from 'src/app/features/tasks/task.model';
 import { IssueServiceInterface } from '../../issue-service-interface';
 import { IssueProviderCaldav, SearchResultItem } from '../../issue.model';
-import { CaldavIssue, CaldavIssueReduced } from './caldav-issue.model';
+import {
+  CaldavIssueReduced,
+  CaldavEventReduced,
+  CaldavIssueOrEvent,
+  isCaldavEvent,
+} from './caldav-issue.model';
 import { CaldavClientService } from './caldav-client.service';
 import { CaldavCfg } from './caldav.model';
 import { concatMap, first, map, switchMap } from 'rxjs/operators';
@@ -11,6 +16,7 @@ import { truncate } from '../../../../util/truncate';
 import { isCaldavEnabled } from './is-caldav-enabled.util';
 import { CALDAV_POLL_INTERVAL } from './caldav.const';
 import { IssueProviderService } from '../../issue-provider.service';
+import { getDbDateStr } from '../../../../util/get-db-date-str';
 
 @Injectable({
   providedIn: 'root',
@@ -30,8 +36,12 @@ export class CaldavCommonInterfacesService implements IssueServiceInterface {
   }
 
   testConnection(cfg: CaldavCfg): Promise<boolean> {
-    return this._caldavClientService
-      .searchOpenTasks$('', cfg)
+    const search$ =
+      cfg.componentType === 'VEVENT'
+        ? this._caldavClientService.searchOpenEvents$('', cfg)
+        : this._caldavClientService.searchOpenTasks$('', cfg);
+
+    return search$
       .pipe(
         map((res) => Array.isArray(res)),
         first(),
@@ -40,19 +50,41 @@ export class CaldavCommonInterfacesService implements IssueServiceInterface {
       .then((result) => result ?? false);
   }
 
-  getAddTaskData(issueData: CaldavIssue): IssueTask {
-    return {
-      title: issueData.summary,
-      issueLastUpdated: issueData.etag_hash,
-      notes: issueData.note,
-      dueWithTime: issueData.start,
-      related_to: issueData.related_to,
-    };
+  getAddTaskData(issueData: CaldavIssueOrEvent): IssueTask {
+    if (isCaldavEvent(issueData)) {
+      // VEVENT mapping
+      const dueDateFields = issueData.isAllDay
+        ? { dueDay: getDbDateStr(issueData.start) }
+        : { dueWithTime: issueData.start };
+
+      return {
+        title: issueData.summary,
+        issueLastUpdated: issueData.etag_hash,
+        notes: issueData.description,
+        timeEstimate: issueData.duration,
+        ...dueDateFields,
+      };
+    } else {
+      // VTODO mapping
+      return {
+        title: issueData.summary,
+        issueLastUpdated: issueData.etag_hash,
+        notes: issueData.note,
+        dueWithTime: issueData.start,
+        related_to: issueData.related_to,
+      };
+    }
   }
 
-  getById(id: string | number, issueProviderId: string): Promise<CaldavIssue> {
+  getById(id: string | number, issueProviderId: string): Promise<CaldavIssueOrEvent> {
     return this._getCfgOnce$(issueProviderId)
-      .pipe(concatMap((caldavCfg) => this._caldavClientService.getById$(id, caldavCfg)))
+      .pipe(
+        concatMap((caldavCfg) =>
+          caldavCfg.componentType === 'VEVENT'
+            ? this._caldavClientService.getEventById$(id, caldavCfg)
+            : this._caldavClientService.getById$(id, caldavCfg),
+        ),
+      )
       .toPromise()
       .then((result) => {
         if (!result) {
@@ -68,7 +100,7 @@ export class CaldavCommonInterfacesService implements IssueServiceInterface {
 
   async getFreshDataForIssueTask(task: Task): Promise<{
     taskChanges: Partial<Task>;
-    issue: CaldavIssue;
+    issue: CaldavIssueOrEvent;
     issueTitle: string;
   } | null> {
     if (!task.issueProviderId) {
@@ -79,7 +111,17 @@ export class CaldavCommonInterfacesService implements IssueServiceInterface {
     }
 
     const cfg = await this._getCfgOnce$(task.issueProviderId).toPromise();
-    const issue = await this._caldavClientService.getById$(task.issueId, cfg).toPromise();
+    if (!cfg) {
+      throw new Error('Failed to get CalDAV config');
+    }
+    const issue: CaldavIssueOrEvent | undefined =
+      cfg.componentType === 'VEVENT'
+        ? await this._caldavClientService.getEventById$(task.issueId, cfg).toPromise()
+        : await this._caldavClientService.getById$(task.issueId, cfg).toPromise();
+
+    if (!issue) {
+      throw new Error('Failed to get CalDAV issue');
+    }
 
     const wasUpdated = issue.etag_hash !== task.issueLastUpdated;
 
@@ -100,7 +142,7 @@ export class CaldavCommonInterfacesService implements IssueServiceInterface {
 
   async getFreshDataForIssueTasks(
     tasks: Task[],
-  ): Promise<{ task: Task; taskChanges: Partial<Task>; issue: CaldavIssue }[]> {
+  ): Promise<{ task: Task; taskChanges: Partial<Task>; issue: CaldavIssueOrEvent }[]> {
     // First sort the tasks by the issueId
     // because the API returns it in a desc order by issue iid(issueId)
     // so it makes the update check easier and faster
@@ -111,22 +153,31 @@ export class CaldavCommonInterfacesService implements IssueServiceInterface {
     }
 
     const cfg = await this._getCfgOnce$(issueProviderId).toPromise();
-    const issues: CaldavIssue[] = await this._caldavClientService
-      .getByIds$(
-        tasks.map((t) => t.id),
-        cfg,
-      )
-      .toPromise();
+    if (!cfg) {
+      throw new Error('Failed to get CalDAV config');
+    }
+
+    // Get all issues/events depending on componentType
+    const issues: CaldavIssueOrEvent[] =
+      cfg.componentType === 'VEVENT'
+        ? ((await this._caldavClientService.getOpenEvents$(cfg).toPromise()) ?? [])
+        : ((await this._caldavClientService
+            .getByIds$(
+              tasks.filter((t) => t.issueId).map((t) => t.issueId as string),
+              cfg,
+            )
+            .toPromise()) ?? []);
+
     const issueMap = new Map(issues.map((item) => [item.id, item]));
 
     return tasks
       .filter(
         (task) =>
-          issueMap.has(task.id) &&
-          issueMap.get(task.id)?.etag_hash !== task.issueLastUpdated,
+          issueMap.has(task.issueId as string) &&
+          issueMap.get(task.issueId as string)?.etag_hash !== task.issueLastUpdated,
       )
       .map((task) => {
-        const issue = issueMap.get(task.id) as CaldavIssue;
+        const issue = issueMap.get(task.issueId as string) as CaldavIssueOrEvent;
         return {
           task,
           taskChanges: {
@@ -141,11 +192,14 @@ export class CaldavCommonInterfacesService implements IssueServiceInterface {
   searchIssues(searchTerm: string, issueProviderId: string): Promise<SearchResultItem[]> {
     return this._getCfgOnce$(issueProviderId)
       .pipe(
-        switchMap((caldavCfg) =>
-          this.isEnabled(caldavCfg)
-            ? this._caldavClientService.searchOpenTasks$(searchTerm, caldavCfg)
-            : of([]),
-        ),
+        switchMap((caldavCfg) => {
+          if (!this.isEnabled(caldavCfg)) {
+            return of([]);
+          }
+          return caldavCfg.componentType === 'VEVENT'
+            ? this._caldavClientService.searchOpenEvents$(searchTerm, caldavCfg)
+            : this._caldavClientService.searchOpenTasks$(searchTerm, caldavCfg);
+        }),
       )
       .toPromise()
       .then((result) => result ?? []);
@@ -154,9 +208,14 @@ export class CaldavCommonInterfacesService implements IssueServiceInterface {
   async getNewIssuesToAddToBacklog(
     issueProviderId: string,
     allExistingIssueIds: number[] | string[],
-  ): Promise<CaldavIssueReduced[]> {
+  ): Promise<CaldavIssueReduced[] | CaldavEventReduced[]> {
     const cfg = await this._getCfgOnce$(issueProviderId).toPromise();
-    return await this._caldavClientService.getOpenTasks$(cfg).toPromise();
+    if (!cfg) {
+      throw new Error('Failed to get CalDAV config');
+    }
+    return cfg.componentType === 'VEVENT'
+      ? ((await this._caldavClientService.getOpenEvents$(cfg).toPromise()) ?? [])
+      : ((await this._caldavClientService.getOpenTasks$(cfg).toPromise()) ?? []);
   }
 
   private _getCfgOnce$(issueProviderId: string): Observable<IssueProviderCaldav> {
