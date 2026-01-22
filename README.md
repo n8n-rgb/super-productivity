@@ -546,3 +546,5 @@ This will automatically apply compatibility fixes including:
 - Setting the appropriate environment variables for X11 compatibility
 
 The application will automatically detect Wayland sessions and apply these fixes, but you can use this flag if automatic detection doesn't work properly.
+
+<!-- Test commit to verify PR Preview Deploy workflow -->
